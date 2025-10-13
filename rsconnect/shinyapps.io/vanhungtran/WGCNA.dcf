@@ -1,0 +1,13 @@
+name: WGCNA
+title: WGCNA
+username: vanhungtran
+account: vanhungtran
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15744716
+bundleId: 11030193
+url: https://vanhungtran.shinyapps.io/WGCNA/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: app1.R
