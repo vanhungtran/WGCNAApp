@@ -1,6 +1,8 @@
 # app.R
 # WGCNA interactive Shiny app with DESeq2, fast QC plots, WGCNA, and GO/KEGG enrichment
-# Author: LT (corrected & hardened)
+# + Combined "Network / TOM + IDs" with Genes & GO/KEGG tables
+# Fixed: robust ID mapping (auto-detect fromType, organism sanity, graceful fallbacks)
+# Author: LT (corrected, hardened & fixed)
 
 # =============================
 # Packages
@@ -93,7 +95,7 @@ org_map <- function(org_choice){
   )
 }
 
-# --- New: ID helpers for robust mapping ---
+# --- ID helpers for robust mapping ---
 guess_id_type <- function(ids){
   ids <- unique(ids); ids <- ids[!is.na(ids)]; n <- length(ids)
   if (n == 0) return("SYMBOL")
@@ -108,7 +110,9 @@ guess_id_type <- function(ids){
 robust_map_to_entrez <- function(ids, id_type, OrgDb){
   ids <- unique(ids); ids <- ids[!is.na(ids)]
   strip_ver <- function(x) sub("\\.\\d+$", "", x)
-  candidates <- unique(c(id_type, guess_id_type(ids), if(id_type!="SYMBOL") "SYMBOL", "ALIAS", if(id_type!="ENSEMBL") "ENSEMBL", "ENTREZID"))
+  candidates <- unique(c(id_type, guess_id_type(ids),
+                         if(id_type!="SYMBOL") "SYMBOL", "ALIAS",
+                         if(id_type!="ENSEMBL") "ENSEMBL", "ENTREZID"))
   best <- list(df=NULL, coverage=0, fromType=NULL)
   for (ft in candidates){
     ids_ft <- if (ft == "ENSEMBL") strip_ver(ids) else ids
@@ -121,6 +125,35 @@ robust_map_to_entrez <- function(ids, id_type, OrgDb){
     }
   }
   best
+}
+
+# Multi-target mapper with robust fromType auto-detection (FIX for mapping failures)
+robust_map_multi <- function(ids, user_fromType, toTypes, OrgDb_obj){
+  ids <- unique(ids); ids <- ids[!is.na(ids)]
+  if (length(ids) == 0) return(list(df=NULL, fromType=NULL, coverage=0))
+  strip_ver <- function(x) sub("\\.\\d+$", "", x)
+  # Try user choice first, then a smart fallback set
+  candidates <- unique(c(user_fromType, guess_id_type(ids), "ENSEMBL","SYMBOL","ALIAS","ENTREZID"))
+  best <- list(df=NULL, fromType=NULL, coverage=-1)
+  for (ft in candidates){
+    ids_ft <- if (ft == "ENSEMBL") strip_ver(ids) else ids
+    m <- try(clusterProfiler::bitr(ids_ft, fromType = ft, toType = unique(toTypes), OrgDb = OrgDb_obj), silent = TRUE)
+    if (inherits(m, "try-error") || is.null(m) || nrow(m) == 0) next
+    if (!ft %in% colnames(m)) next
+    # 1:many collapses — keep first per key for a clean table export
+    m <- m[!duplicated(m[[ft]]), , drop = FALSE]
+    cov <- mean(ids_ft %in% m[[ft]])
+    if (is.finite(cov) && cov > best$coverage) best <- list(df=m, fromType=ft, coverage=cov)
+  }
+  best
+}
+
+# generic (non-robust) multi-target mapper (kept for internal use)
+bitr_multi <- function(ids, fromType, toTypes, OrgDb_obj){
+  toTypes <- unique(toTypes)
+  out <- try(clusterProfiler::bitr(ids, fromType = fromType, toType = toTypes, OrgDb = OrgDb_obj), silent = TRUE)
+  if (inherits(out, "try-error") || is.null(out) || nrow(out) == 0) return(NULL)
+  out[!duplicated(out[[fromType]]), , drop = FALSE]
 }
 
 # =============================
@@ -267,15 +300,52 @@ ui <- navbarPage(
            )
   ),
   
-  tabPanel("Network / TOM",
+  # --- COMBINED TAB: Network / TOM + IDs (with Genes and mirrored GO/KEGG tables) ---
+  tabPanel("Network / TOM + IDs",
            sidebarLayout(
-             sidebarPanel(
-               sliderInput("tom_thresh", "TOM edge threshold", min=0, max=1, value=0.2, step=0.01),
-               actionButton("build_tom", "Build TOM for selected modules", class="btn-primary"),
-               downloadButton("dl_edges", "Download edge list")
+             sidebarPanel(width = 4,
+                          h4("Network / TOM"),
+                          uiOutput("mods_for_netmap_ui"),
+                          sliderInput("tom_thresh", "TOM edge threshold", min=0, max=1, value=0.2, step=0.01),
+                          actionButton("build_tom", "Build TOM for selected modules", class="btn-primary"),
+                          downloadButton("dl_edges", "Download edge list"),
+                          hr(),
+                          h4("ID Mapping"),
+                          selectInput("map_source", "Gene set",
+                                      choices = c("All filtered genes", "All network genes", "Selected modules"),
+                                      selected = "All filtered genes"),
+                          selectInput("map_org", "Organism",
+                                      choices = c("Human (Homo sapiens)", "Mouse (Mus musculus)"),
+                                      selected = "Human (Homo sapiens)"),
+                          selectInput("from_id", "From ID type",
+                                      choices = c("ENSEMBL","SYMBOL","ENTREZID","ALIAS"),
+                                      selected = "ENSEMBL"),
+                          checkboxGroupInput("to_id", "To ID type(s)",
+                                             choices = c("SYMBOL","ENSEMBL","ENTREZID","ALIAS"),
+                                             selected = c("SYMBOL","ENTREZID")),
+                          actionButton("run_idmap", "Build mapping table", class = "btn-primary"),
+                          hr(),
+                          verbatimTextOutput("idmap_summary")
              ),
              mainPanel(
-               withSpinner(DTOutput("edges_tbl"), type=6)
+               tabsetPanel(
+                 tabPanel("Edges", withSpinner(DTOutput("edges_tbl"), type=6)),
+                 tabPanel("Genes",
+                          withSpinner(DTOutput("genes_tbl"), type=6),
+                          hr(),
+                          downloadButton("dl_genes", "Download genes CSV")
+                 ),
+                 tabPanel("ID Mapping",
+                          withSpinner(DTOutput("idmap_table"), type=6),
+                          hr(), downloadButton("dl_idmap", "Download mapping CSV")
+                 ),
+                 tabPanel("GO (from Enrichment)",
+                          withSpinner(DTOutput("go_table2"), type=6)
+                 ),
+                 tabPanel("KEGG (from Enrichment)",
+                          withSpinner(DTOutput("kegg_table2"), type=6)
+                 )
+               )
              )
            )
   ),
@@ -290,15 +360,15 @@ ui <- navbarPage(
            fluidRow(
              column(8, offset=2,
                     h3("About this app"),
-                    p("Interactive WGCNA app built from your R Markdown workflow. Steps: data upload, QC, DESeq2, variance filtering, soft-threshold selection, module detection, trait association, TOM edge export, and GO/KEGG enrichment per module."),
+                    p("Interactive WGCNA app: data upload, QC, DESeq2, variance filtering, soft-threshold selection, module detection, trait association, TOM edge export, GO/KEGG enrichment, and a combined Network/ID mapping tab with Genes & mirrored enrichment tables."),
                     tags$ul(
                       tags$li("Inputs: raw counts matrix and metadata with a 'group' column (configurable)."),
                       tags$li("Uses DESeq2 VST for WGCNA input; variance filter by row variance quantile."),
-                      tags$li("Soft-threshold picked via pickSoftThreshold; auto-picks power if enabled."),
-                      tags$li("Modules via blockwiseModules with robust pre-checks (goodSamplesGenes)."),
-                      tags$li("GO/KEGG enrichment with clusterProfiler, flexible IDs and organism settings.")
-                    ),
-                    p("Packages: WGCNA, DESeq2, BioNERO, IHW, ComplexHeatmap, DEGreport, edgeR, tidyverse, clusterProfiler, enrichplot.")
+                      tags$li("Soft-threshold via pickSoftThreshold with auto-pick option."),
+                      tags$li("Modules via blockwiseModules with goodSamplesGenes pre-check."),
+                      tags$li("GO/KEGG enrichment with clusterProfiler and flexible IDs/organism."),
+                      tags$li("Network/TOM + ID Mapping unified; Genes table and GO/KEGG mirrors included.")
+                    )
              )
            )
   )
@@ -473,7 +543,8 @@ server <- function(input, output, session){
   output$contrast_ui <- renderUI({
     meta <- req(rv$meta); grp <- req(input$group_col); validate(need(grp %in% colnames(meta), "Group column missing"))
     levs <- sort(unique(meta[[grp]]))
-    fluidRow(column(12, selectInput("grpA", "Group A (treatment)", choices = levs), selectInput("grpB", "Group B (reference)", choices = levs, selected = if (length(levs)>=2) levs[2] else NULL)))
+    fluidRow(column(12, selectInput("grpA", "Group A (treatment)", choices = levs),
+                    selectInput("grpB", "Group B (reference)", choices = levs, selected = if (length(levs)>=2) levs[2] else NULL)))
   })
   
   output$res_table <- renderDT({ res <- req(res_reactive()); df <- as.data.frame(res) %>% tibble::rownames_to_column("gene_id"); datatable(df, options=list(scrollX=TRUE), filter = "top") })
@@ -557,6 +628,7 @@ server <- function(input, output, session){
     rownames(rv$module_df) <- rv$module_df$gene_id
     MEs0 <- moduleEigengenes(input_mat, mergedColors)$eigengenes %>% orderMEs(); rv$MEs0 <- MEs0; rv$module_order <- gsub("ME","", colnames(MEs0))
     updateSelectInput(session, "enr_modules", choices = sort(unique(mergedColors)), selected = sort(unique(mergedColors))[1:min(3, length(unique(mergedColors)))])
+    updateSelectInput(session, "mods_for_netmap", choices = sort(unique(mergedColors)), selected = sort(unique(mergedColors))[1:min(3, length(unique(mergedColors)))])
   })
   
   output$dendro_colors <- renderPlot({ net <- req(rv$net); mergedColors <- labels2colors(net$colors)
@@ -723,30 +795,228 @@ server <- function(input, output, session){
   )
   
   # -----------------
-  # Network / TOM
+  # Combined Network / TOM + ID Mapping logic (with Genes + mirrored GO/KEGG)
   # -----------------
+  output$mods_for_netmap_ui <- renderUI({
+    df <- rv$module_df
+    if (is.null(df)) return(helpText("Run WGCNA to populate modules."))
+    mods <- sort(unique(df$colors))
+    selectizeInput("mods_for_netmap", "Modules (used by TOM & 'Selected modules' mapping)",
+                   choices = mods, multiple = TRUE, selected = head(mods, 3))
+  })
+  
+  # Edges/TOM using the shared module picker
   edges_reactive <- eventReactive(input$build_tom, {
-    mat <- req(rv$expr_norm); dfm <- req(rv$module_df); sel <- req(input$modules_of_interest)
+    mat <- req(rv$expr_norm); dfm <- req(rv$module_df)
+    sel <- req(input$mods_for_netmap)
     genes <- dfm %>% dplyr::filter(colors %in% sel) %>% pull(gene_id)
     expr_of_interest <- mat[intersect(rownames(mat), genes), ]
     validate(need(nrow(expr_of_interest) >= 2, "Not enough genes to build TOM."))
     picked <- req(input$picked_power)
     TOM <- TOMsimilarityFromExpr(t(expr_of_interest), power = picked, TOMType = input$tom_type)
     rownames(TOM) <- colnames(TOM) <- rownames(expr_of_interest)
-    edge_list <- as.data.frame(TOM) %>% tibble::rownames_to_column("gene1") %>% tidyr::pivot_longer(-gene1, names_to = "gene2", values_to = "correlation") %>% dplyr::filter(gene1 != gene2, correlation >= input$tom_thresh) %>% distinct()
+    edge_list <- as.data.frame(TOM) %>% tibble::rownames_to_column("gene1") %>% 
+      tidyr::pivot_longer(-gene1, names_to = "gene2", values_to = "correlation") %>% 
+      dplyr::filter(gene1 != gene2, correlation >= input$tom_thresh) %>% distinct()
     edge_list$module1 <- dfm[edge_list$gene1,]$colors
     edge_list$module2 <- dfm[edge_list$gene2,]$colors
     edge_list
   })
-  
   output$edges_tbl <- renderDT({ datatable(req(edges_reactive()), options=list(scrollX=TRUE), filter = "top") })
   output$dl_edges <- downloadHandler(
     filename = function(){ paste0("edges_thr", input$tom_thresh, ".csv") },
     content = function(file){ readr::write_csv(req(edges_reactive()), file) }
   )
   
+  # ===== ID Mapping (robust) =====
+  idmap_run <- eventReactive(input$run_idmap, {
+    mat <- rv$expr_norm
+    validate(need(!is.null(mat), "Run 'Variance filter' first so we have filtered genes (and VST)."))
+    source_choice <- req(input$map_source)
+    
+    if (source_choice == "All filtered genes") {
+      genes_in <- rownames(mat)
+      module_map_df <- NULL
+    } else {
+      dfm <- req(rv$module_df)
+      if (source_choice == "All network genes") {
+        genes_in <- dfm$gene_id
+        module_map_df <- dfm
+      } else {
+        sel <- req(input$mods_for_netmap)
+        genes_in <- dfm$gene_id[dfm$colors %in% sel]
+        module_map_df <- dfm[dfm$colors %in% sel, , drop = FALSE]
+      }
+    }
+    validate(need(length(genes_in) > 0, "No genes found in the chosen set."))
+    
+    # Auto-switch organism if Ensembl prefixes disagree with selection
+    sp <- guess_species_from_ids(genes_in)
+    if (!is.na(sp)) {
+      if (sp == "hsa" && input$map_org != "Human (Homo sapiens)") {
+        updateSelectInput(session, "map_org", selected = "Human (Homo sapiens)")
+        showNotification("Switched organism to Human based on Ensembl prefixes.", type="message")
+      }
+      if (sp == "mmu" && input$map_org != "Mouse (Mus musculus)") {
+        updateSelectInput(session, "map_org", selected = "Mouse (Mus musculus)")
+        showNotification("Switched organism to Mouse based on Ensembl prefixes.", type="message")
+      }
+    }
+    
+    om <- org_map(input$map_org)
+    validate(need(requireNamespace(om$OrgDb, quietly = TRUE),
+                  paste0("Install Bioconductor package '", om$OrgDb, "'.")))
+    suppressPackageStartupMessages(require(om$OrgDb, character.only = TRUE))
+    OrgDb_obj <- get(om$OrgDb)
+    
+    toTypes  <- req(input$to_id)
+    validate(need(length(toTypes) > 0, "Pick at least one target ID type."))
+    
+    # Robust mapping: try multiple fromTypes and pick best coverage
+    attempt <- robust_map_multi(genes_in, user_fromType = input$from_id, toTypes = toTypes, OrgDb_obj = OrgDb_obj)
+    validate(need(!is.null(attempt$df) && nrow(attempt$df) > 0, "Mapping failed. Try a different organism or From ID type."))
+    m <- attempt$df
+    from_used <- attempt$fromType
+    cov <- attempt$coverage
+    
+    # Attach Module if available (match key according to from_used, with ENSEMBL version stripping)
+    if (!is.null(module_map_df)) {
+      df_join <- module_map_df
+      key_vec <- if (from_used == "ENSEMBL") strip_ensembl_version(df_join$gene_id) else df_join$gene_id
+      names(key_vec) <- df_join$gene_id
+      m$Module <- df_join$colors[ match(m[[from_used]], key_vec) ]
+    }
+    
+    # Keep tidy columns: source key first, Module, then requested targets
+    keep_cols <- c(from_used, if ("Module" %in% names(m)) "Module", toTypes)
+    keep_cols <- keep_cols[keep_cols %in% names(m)]
+    m <- m[, keep_cols, drop = FALSE]
+    
+    # Attach attributes for summary
+    attr(m, "coverage") <- cov
+    attr(m, "from_used") <- from_used
+    attr(m, "n_input") <- length(unique(genes_in))
+    m
+  })
+  
+  output$idmap_table <- renderDT({
+    m <- req(idmap_run())
+    datatable(m, options = list(scrollX = TRUE), filter = "top")
+  })
+  
+  output$idmap_summary <- renderText({
+    m <- req(idmap_run())
+    cov <- attr(m, "coverage"); n_in <- attr(m, "n_input"); from_used <- attr(m, "from_used")
+    paste0("Mapping summary:\n",
+           "  • Inputs (unique): ", n_in, "\n",
+           "  • From key type used: ", from_used, "\n",
+           "  • To: {", paste(input$to_id, collapse = ", "), "}\n",
+           sprintf("  • Coverage: %.1f%%", 100 * cov),
+           if (!is.null(m$Module)) "\n  • Source includes network/module genes (Module column present)" else "")
+  })
+  
+  output$dl_idmap <- downloadHandler(
+    filename = function(){ 
+      from_used <- attr(req(idmap_run()), "from_used"); 
+      paste0("id_mapping_", from_used, "_to_", paste(input$to_id, collapse = "-"), ".csv")
+    },
+    content  = function(file){
+      readr::write_csv(req(idmap_run()), file)
+    }
+  )
+  
+  # ===== Genes table (uses same selection controls; enrich with robust mapping) =====
+  genes_tbl_reactive <- reactive({
+    mat <- rv$expr_norm
+    validate(need(!is.null(mat), "Run 'Variance filter' first to define the filtered gene universe."))
+    source_choice <- req(input$map_source)
+    
+    # choose genes, optionally with Module column
+    if (source_choice == "All filtered genes") {
+      genes_in <- rownames(mat)
+      module_map_df <- NULL
+    } else {
+      dfm <- req(rv$module_df)
+      if (source_choice == "All network genes") {
+        genes_in <- dfm$gene_id
+        module_map_df <- dfm
+      } else { # "Selected modules"
+        sel <- req(input$mods_for_netmap)
+        genes_in <- dfm$gene_id[dfm$colors %in% sel]
+        module_map_df <- dfm[dfm$colors %in% sel, , drop = FALSE]
+      }
+    }
+    validate(need(length(genes_in) > 0, "No genes found in the chosen set."))
+    
+    out <- tibble::tibble(gene_id = genes_in)
+    if (!is.null(module_map_df))
+      out$Module <- module_map_df$colors[ match(out$gene_id, module_map_df$gene_id) ]
+    
+    om <- org_map(input$map_org)
+    if (!requireNamespace(om$OrgDb, quietly = TRUE)) {
+      showNotification(paste0("Install Bioconductor package '", om$OrgDb, "' to add SYMBOL/ENSEMBL/ENTREZID columns."), type="warning")
+      return(out)
+    }
+    suppressPackageStartupMessages(require(om$OrgDb, character.only = TRUE))
+    OrgDb_obj <- get(om$OrgDb)
+    
+    # Always try to enrich with standard IDs using robust mapping
+    toTypes <- unique(c(input$to_id, "SYMBOL","ENSEMBL","ENTREZID"))
+    attempt <- robust_map_multi(genes_in, user_fromType = input$from_id, toTypes = toTypes, OrgDb_obj = OrgDb_obj)
+    if (is.null(attempt$df) || nrow(attempt$df) == 0) return(out)
+    
+    m <- attempt$df
+    from_used <- attempt$fromType
+    # join by correct key
+    m_key <- m; names(m_key)[names(m_key) == from_used] <- "map_key"
+    out$map_key <- if (from_used == "ENSEMBL") strip_ensembl_version(out$gene_id) else out$gene_id
+    out <- dplyr::left_join(out, m_key, by = "map_key")
+    out$map_key <- NULL
+    
+    # order columns nicely
+    first_cols <- c("gene_id", if ("Module" %in% names(out)) "Module")
+    std_cols   <- intersect(c("SYMBOL","ENSEMBL","ENTREZID","ALIAS"), names(out))
+    other_cols <- setdiff(names(out), c(first_cols, std_cols))
+    out <- out[, c(first_cols, std_cols, other_cols), drop = FALSE]
+    out
+  })
+  
+  output$genes_tbl <- renderDT({
+    datatable(req(genes_tbl_reactive()), options = list(scrollX = TRUE), filter = "top")
+  })
+  
+  output$dl_genes <- downloadHandler(
+    filename = function(){ "genes_table.csv" },
+    content  = function(file){ readr::write_csv(req(genes_tbl_reactive()), file) }
+  )
+  
+  # Mirror enrichment tables in combined tab
+  output$go_table2 <- renderDT({
+    x <- enrich_run()
+    validate(need(!is.null(x$go), "Run enrichment in the 'Enrichment (GO/KEGG)' tab."))
+    datatable(x$go, options = list(scrollX = TRUE), filter = "top")
+  })
+  
+  output$kegg_table2 <- renderDT({
+    x <- enrich_run()
+    validate(need(!is.null(x$kegg), "Run enrichment in the 'Enrichment (GO/KEGG)' tab."))
+    datatable(x$kegg, options = list(scrollX = TRUE), filter = "top")
+  })
+  
+  # Auto-suggest the From ID type (now proactive: switch if guess disagrees & mapping not yet run)
+  observe({
+    ids_guess <- if (!is.null(rv$module_df)) rv$module_df$gene_id else if (!is.null(rv$expr_norm)) rownames(rv$expr_norm) else NULL
+    if (is.null(ids_guess)) return()
+    guess <- guess_id_type(ids_guess)
+    # If user hasn't interacted or the default is likely wrong, nudge the selection
+    if (!identical(guess, input$from_id)) {
+      updateSelectInput(session, "from_id", selected = guess)
+      showNotification(paste0("Auto-detected From ID type: ", guess), type="message", duration = 4)
+    }
+  })
+  
   # -----------------
-  # Downloads
+  # Downloads (misc)
   # -----------------
   output$dl_se <- downloadHandler(
     filename = function(){ "wgcna_input_se.rds" },
